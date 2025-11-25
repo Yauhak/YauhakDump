@@ -1,2 +1,2 @@
 # YauhakDump
-A trial recompiler through which I could learn ISA~~~///(^v^)\\\~~~
+A trial decompiler through which I could learn ISA~~~///(^v^)\\\~~~
