@@ -10,20 +10,27 @@ uint8_t *ptrOfMC;
 char ASMCode[250 * 1024];
 char *ASMptr = ASMCode;
 // Flags of prefixes
-// isRet is the flag of ret command
-uint8_t is64bit = 0, isExtCmd = 0, isRet = 0;
+// isRet indicates whether a RET instruction was encountered
+// segPrefix indicates which segment of memory would the instruction read from
+uint8_t is64bit = 0, isExtReg = 0, isExtCmd = 0, isRet = 0, segPrefix;
 // Size of raw text section data
 uint32_t sizeOfRawData;
 // Names of normal registers
 const char *reg8[] = {"%AL", "%CL", "%DL", "%BL", "%AH", "%CH", "%DH", "%BH"};
 const char *reg16[] = {"%AX", "%CX", "%DX", "%BX", "%SP", "%BP", "%SI", "%DI"};
 const char *reg32[] = {"%EAX", "%ECX", "%EDX", "%EBX", "%ESP", "%EBP", "%ESI", "%EDI"};
-const char *reg64[] = {"%RAX", "%RCX", "%RDX", "%RBX", "%RSP", "%RBP", "%RSI", "%RDI"};
+const char *reg64[] = {
+	"%RAX", "%RCX", "%RDX", "%RBX", "%RSP", "%RBP", "%RSI", "%RDI",
+	"%R08", "%R09", "%R10", "%R11", "%R12", "%R13", "%R14", "%R15"
+};
 // (regName) means the computer see value in some register as some memory's address
 const char *reg8_add[] = {"(%AL)", "(%CL)", "(%DL)", "(%BL)", "(%AH)", "(%CH)", "(%DH)", "(%BH)"};
 const char *reg16_add[] = {"(%AX)", "(%CX)", "(%DX)", "(%BX)", "(%SP)", "(%BP)", "(%SI)", "(%DI)"};
 const char *reg32_add[] = {"(%EAX)", "(%ECX)", "(%EDX)", "(%EBX)", "(%ESP)", "(%EBP)", "(%ESI)", "(%EDI)"};
-const char *reg64_add[] = {"(%RAX)", "(%RCX)", "(%RDX)", "(%RBX)", "(%RSP)", "(%RBP)", "(%RSI)", "(%RDI)"};
+const char *reg64_add[] = {
+	"(%RAX)", "(%RCX)", "(%RDX)", "(%RBX)", "(%RSP)", "(%RBP)", "(%RSI)", "(%RDI)",
+	"(%R08)", "(%R09)", "(%R10)", "(%R11)", "(%R12)", "(%R13)", "(%R14)", "(%R15)"
+};
 // Variables to simulate 64-bit registers
 // We can use them to track program progress when meet code like "SUB 33,%RIP;CALL %RIP"
 int64_t R64s[9];
@@ -53,7 +60,7 @@ void mapFileToMem(const char *fileName) {
 }
 
 // Skip to text section table
-void skipToTextSectionTable() {
+void skipToEntry() {
 	if (machineCode[0] != 'M' || machineCode[1] != 'Z') {
 		printf("Not a valid PE file: Missing MZ signature\n");
 		return;
@@ -90,27 +97,35 @@ void skipToTextSectionTable() {
 	printf(".text section not found\n");
 }
 
-// Check whether the byte is a prefix
+// Check whether the byte is a prefix byte
 // If so,set up relevant flags
 uint8_t isPrefixByte(uint8_t byte) {
 	int i = 0;
 	uint8_t prefix = byte & 0xF0;
 	for (; i <= 12; i++) {
-		if (prefix == PrefixBytes[i]) {
+		if (prefix == PrefixBytes[i] || byte == PrefixBytes[i]) {
 			break;
 		}
 	}
 	if (i <= 12) {
 		if (prefix == REX_START) {
-			// If it is an extended-code prefix
+			// If it is an extended-code prefix byte
 			if (byte == 0x0F) {
 				//Set up the flag
 				isExtCmd = 1;
 			} else isExtCmd = 0;
-			// If it is a REX prefix
+			// If it is a REX prefix byte
 			if (byte & 0x08) {
 				is64bit = 1;
 			} else is64bit = 0;
+			if (byte & 0x01) {
+				isExtReg = 1;
+			} else isExtReg = 0;
+		}
+		if (byte == 0x65 || byte == 0x64 ||
+		    byte == 0x3E || byte == 0x2E ||
+		    byte == 0x36 || byte == 0x26) {
+			segPrefix = byte;
 		}
 		return 1;
 	}
@@ -127,14 +142,26 @@ void writeASM(const char *string, int size) {
 
 //---------------------------------Core functions----------------------------------------
 
-// RET ;return immidiately to last calling position
+// RET ;return immediately to last calling position
 void ret() {
 	writeASM("RET\n", 4);
 }
 
 // PUSH %RBP ;Push RBP's value to stack
-void pushRBP() {
-	writeASM("PUSHQ %RBP\n", 11);
+void handle_push_register(uint8_t byte) {
+	uint8_t reg_num = byte & 0x07;
+	if (is64bit) {
+		if (isExtReg) {
+			reg_num += 8; // R8-R15
+		}
+		writeASM("PUSHQ ", 6);
+		writeASM(reg64[reg_num], strlen(reg64[reg_num]));
+	} else {
+		writeASM("PUSHL ", 6);
+		writeASM(reg32[reg_num], strlen(reg32[reg_num]));
+	}
+	writeASM("\n", 1);
+	R64s[REG_RSP] -= is64bit ? 8 : 4;
 }
 
 // PUSH %RBP ;Pop stack's top element and save it to RBP
@@ -180,7 +207,7 @@ void mov_szb_r_rm(uint8_t isSB) {
 	if (mod == 0 || mod == 3) {
 		if (mod == 3) {
 			/*
-				As one of GNU-ASM's dio-parameter command
+				As one of GNU-ASM's dio-parameter instruction
 				The first param is usually seemed as source
 				And the second param always be the destination
 				For example,"MOVL %EAX,(%RBP)" means move 32-bit number from EAX to RBP-pointed memory
@@ -189,12 +216,12 @@ void mov_szb_r_rm(uint8_t isSB) {
 			writeASM(",", 1);
 			writeASM(is64bit ? reg32[r_m] : reg64[r_m], 4);
 			if (is64bit) {
-				// 64位扩展，源寄存器低8位符号/零扩展到目标寄存器
+				// 64-bit extension
 				R64s[r_m] = (isSB && (R64s[reg] & 0x80)) ?
 				            (R64s[reg] | 0xFFFFFFFFFFFFFF00) :
 				            (R64s[reg] & 0xFF);
 			} else {
-				// 32位扩展
+				// 32-bit extension
 				R64s[r_m] = (isSB && (R64s[reg] & 0x80)) ?
 				            (R64s[reg] | 0xFFFFFF00) :
 				            (R64s[reg] & 0xFF);
@@ -240,12 +267,11 @@ void mov_szb_r_rm(uint8_t isSB) {
 				writeASM(offsetNumStr,strlen(offsetNumStr));
 
 // MOVL/MOVQ R/M,M/R ;Move a 32-bit/64-bit number from reg/mem to mem/reg
-// MOVL/MOVQ R/M,M/R ;Move a 32-bit/64-bit number from reg/mem to mem/reg
 void mov(uint8_t is_r_rm) {
 	if (is64bit) {
 		writeASM("MOVQ ", 5);
 	} else {
-		writeASM("MOVL ", 4);
+		writeASM("MOVL ", 5);
 	}
 	uint8_t mod = *ptrOfMC >> 6;
 	uint8_t reg = (*ptrOfMC >> 3) & 0x07;
@@ -254,7 +280,7 @@ void mov(uint8_t is_r_rm) {
 	int offset;
 	char offset0, offsetNumStr[16];
 	// Handle finding address relatively with register RIP(With REX.W prefix)
-	// RIP stores current command's address
+	// RIP stores current instruction's address
 	if (is64bit && mod == 0 && r_m == 5) {
 		// RIP + disp32
 		int32_t disp32 = *(int32_t*)ptrOfMC;
@@ -279,9 +305,11 @@ void mov(uint8_t is_r_rm) {
 		}
 	} else if (mod == 0 || mod == 3) {
 		if (is_r_rm) {
-			writeASM(is64bit ? reg64[R1] : reg32[R1], 4);
-			writeASM(",", 1);
-			writeASM(mod == 0 ? reg64_add[R2] : is64bit ? reg64[R2] : reg32[R2], mod == 0 ? 6 : 4);
+			if (r_m != 4) {
+				writeASM(is64bit ? reg64[R1] : reg32[R1], 4);
+				writeASM(",", 1);
+				writeASM(mod == 0 ? reg64_add[R2] : is64bit ? reg64[R2] : reg32[R2], mod == 0 ? 6 : 4);
+			}
 			if (mod == 3) {
 				if (is64bit) {
 					R64s[r_m] = R64s[reg];
@@ -289,17 +317,60 @@ void mov(uint8_t is_r_rm) {
 					R64s[r_m] = R64s[reg] & 0xFFFFFFFF;
 				}
 			} else {
+				// mod == 0 && r_m == 4 indicates the instruction would use SIB byte
+				if (r_m == 4) {
+					uint8_t sib = *ptrOfMC++;
+					uint8_t scale = (sib >> 6) & 0x03;
+					uint8_t index = (sib >> 3) & 0x07;
+					uint8_t base = sib & 0x07;
+					// Now we can only match the case that index == 4 && base == 5 : use immNum32
+					if (index == 4 && base == 5) {
+						int32_t disp32 = *(int32_t*)ptrOfMC;
+						ptrOfMC += 4;
+						char memStr[50];
+						sprintf(memStr, "$%d", disp32);
+						writeASM(reg64[reg], 4);
+						writeASM(",", 1);
+						writeASM(memStr, strlen(memStr));
+					} else {
+						writeASM("SIB addressing", 14);
+					}
+				} else {
+					writeASM(reg64_add[r_m], 6);
+				}
 				R64s[reg] = -1;
 			}
 		} else {
-			writeASM(mod == 0 ? reg64_add[R1] : is64bit ? reg64[R1] : reg32[R1], mod == 0 ? 6 : 4);
-			writeASM(",", 1);
-			writeASM(is64bit ? reg64[R2] : reg32[R2], 4);
+			if (r_m != 4) {
+				writeASM(mod == 0 ? reg64_add[R1] : is64bit ? reg64[R1] : reg32[R1], mod == 0 ? 6 : 4);
+				writeASM(",", 1);
+				writeASM(is64bit ? reg64[R2] : reg32[R2], 4);
+			}
 			if (mod == 3) {
 				if (is64bit) {
 					R64s[reg] = R64s[r_m];
 				} else {
 					R64s[reg] = R64s[r_m] & 0xFFFFFFFF;
+				}
+			} else {
+				if (r_m == 4) {
+					uint8_t sib = *ptrOfMC++;
+					uint8_t scale = (sib >> 6) & 0x03;
+					uint8_t index = (sib >> 3) & 0x07;
+					uint8_t base = sib & 0x07;
+					if (index == 4 && base == 5) {
+						int32_t disp32 = *(int32_t*)ptrOfMC;
+						ptrOfMC += 4;
+						char memStr[50];
+						sprintf(memStr, "$%d", disp32);
+						writeASM(memStr, strlen(memStr));
+						writeASM(",", 1);
+						writeASM(reg64[reg], 4);
+					} else {
+						writeASM("SIB addressing", 14);
+					}
+				} else {
+					writeASM(reg64_add[r_m], 6);
 				}
 			}
 		}
@@ -308,7 +379,7 @@ void mov(uint8_t is_r_rm) {
 			offset0 = *(ptrOfMC++);
 		else {
 			offset = *(int32_t*)ptrOfMC;
-			ptrOfMC++;
+			ptrOfMC += 4;
 		}
 		sprintf(offsetNumStr, "%d", mod == 1 ? offset0 : offset);
 		CS1
@@ -344,6 +415,7 @@ void mov_rm_imm32() {
 	sprintf(immStr, "%d", imm32);
 	int offset;
 	char offset0, offsetNumStr[16];
+	//Find address relatively with register RIP
 	if (is64bit && mod == 0 && r_m == 5) {
 		int32_t disp32 = *(int32_t*)ptrOfMC;
 		ptrOfMC += 4;
@@ -362,7 +434,20 @@ void mov_rm_imm32() {
 		if (mod == 0) {
 			if (r_m == 4) {
 				uint8_t sib = *ptrOfMC++;
-				writeASM("SIB addressing - TODO", 21);
+				uint8_t scale = (sib >> 6) & 0x03;
+				uint8_t index = (sib >> 3) & 0x07;
+				uint8_t base = sib & 0x07;
+				if (index == 4 && base == 5) {
+					int32_t disp32 = *(int32_t*)ptrOfMC;
+					ptrOfMC += 4;
+					char memStr[50];
+					sprintf(memStr, "$%d", disp32);
+					writeASM(memStr, strlen(memStr));
+					writeASM(",", 1);
+					writeASM(reg64[reg], 4);
+				} else {
+					writeASM("SIB addressing", 14);
+				}
 			} else {
 				writeASM(reg64_add[r_m], 6);
 			}
@@ -384,9 +469,71 @@ void mov_rm_imm32() {
 			sprintf(offsetNumStr, "%d", offset);
 		}
 		writeASM(immStr, strlen(immStr));
-		writeASM(", ", 2);
+		writeASM(",", 1);
 		writeASM(offsetNumStr, strlen(offsetNumStr));
 		writeASM(reg64_add[r_m], 6);
+	}
+	is64bit = 0;
+	writeASM("\n", 1);
+}
+
+// XOR r/m, reg - XOR operation between register/memory and register
+void xor_rm_reg(uint8_t is_r_rm) {
+	if (is64bit) {
+		writeASM("XORQ ", 5);
+	} else {
+		writeASM("XORL ", 5);
+	}
+	uint8_t mod = *ptrOfMC >> 6;
+	uint8_t reg = (*ptrOfMC >> 3) & 0x07;
+	uint8_t r_m = *ptrOfMC & 0x07;
+	ptrOfMC++;
+	int offset;
+	char offset0, offsetNumStr[16];
+	if (mod == 0 || mod == 3) {
+		if (is_r_rm) {
+			// XOR reg, r/m
+			writeASM(is64bit ? reg64[R1] : reg32[R1], 4);
+			writeASM(",", 1);
+			writeASM(mod == 0 ? reg64_add[R2] : is64bit ? reg64[R2] : reg32[R2], mod == 0 ? 6 : 4);
+			if (mod == 3) {
+				R64s[reg] ^= R64s[r_m];
+				if (!is64bit) {
+					R64s[reg] &= 0xFFFFFFFF;
+				}
+			}
+		} else {
+			// XOR r/m, reg
+			writeASM(mod == 0 ? reg64_add[R1] : is64bit ? reg64[R1] : reg32[R1], mod == 0 ? 6 : 4);
+			writeASM(",", 1);
+			writeASM(is64bit ? reg64[R2] : reg32[R2], 4);
+			if (mod == 3) {
+				R64s[r_m] ^= R64s[reg];
+				if (!is64bit) {
+					R64s[r_m] &= 0xFFFFFFFF;
+				}
+			}
+		}
+	} else if (mod == 1 || mod == 2) {
+		if (mod == 1) {
+			offset0 = *(ptrOfMC++);
+			sprintf(offsetNumStr, "%d", offset0);
+		} else {
+			offset = *(int32_t*)ptrOfMC;
+			ptrOfMC += 4;
+			sprintf(offsetNumStr, "%d", offset);
+		}
+		CS1
+		if (is_r_rm)
+			writeASM(is64bit ? reg64[R1] : reg32[R1], 4);
+		else
+			writeASM(reg64_add[R1], 6);
+		writeASM(",", 1);
+		CS2
+		if (is_r_rm)
+			writeASM(reg64_add[R2], 6);
+		else
+			writeASM(is64bit ? reg64[R2] : reg32[R2], 4);
 	}
 	is64bit = 0;
 	writeASM("\n", 1);
@@ -747,12 +894,13 @@ void jmp_rm() {
 
 // CALL rel32 ;Call function at relative address
 void call_rel32() {
-	calls[callIndex].addrOfCall = (uint64_t)(ptrOfMC - 1);
+	calls[callIndex].addrOfCall = (uint64_t)(ptrOfMC - 1 - machineCode);
 	calls[callIndex].isReg = 0;
 	writeASM("CALL ", 5);
 	int32_t rel_offset = *(ptrOfMC++) | (*(ptrOfMC++) << 8) |
 	                     (*(ptrOfMC++) << 16) | (*(ptrOfMC++) << 24);
-	calls[callIndex].val = rel_offset;
+	calls[callIndex].val = rel_offset + 5;
+	callIndex++;
 	char offsetStr[16];
 	if (rel_offset >= 0) {
 		sprintf(offsetStr, ".+%d", rel_offset + 5);
@@ -774,9 +922,10 @@ void call_rm() {
 	char offset0, offsetNumStr[16];
 	if (mod == 0 || mod == 3) {
 		if (mod == 3) {
-			calls[callIndex].addrOfCall = (uint64_t)(ptrOfMC - 1);
+			calls[callIndex].addrOfCall = (uint64_t)(ptrOfMC - 1 - machineCode);
 			calls[callIndex].isReg = 1;
 			calls[callIndex].val = R64s[r_m];
+			callIndex++;
 			writeASM(is64bit ? reg64[r_m] : reg32[r_m], 4);
 		} else {
 			writeASM(reg64_add[r_m], 6);
@@ -807,8 +956,16 @@ void ReSub() {
 					ret();
 					isRet = 1;
 					break;
-				case PUSH_RBP:
-					pushRBP();
+				case 0x50:
+				case 0x51:
+				case 0x52:
+				case 0x53:
+				case 0x54:
+				case 0x55:
+				case 0x56:
+				case 0x57:
+					// PUSH instruction
+					handle_push_register(byte);
 					break;
 				case POP_RBP:
 					popRBP();
@@ -831,6 +988,9 @@ void ReSub() {
 					break;
 				case MOV_RM_IMM32:
 					mov_rm_imm32();
+					break;
+				case XOR_RM_REG:
+					xor_rm_reg(0);  // XOR r/m, reg
 					break;
 				case ADD_REG_REG32:
 					add_sub(1, 1);  // ADD reg, r/m
@@ -873,7 +1033,6 @@ void ReSub() {
 							alu_imm32_rm(7);
 							break;
 						default:
-							printf("Unknown 0x81 variant, regField=%d\n", regField);
 							ptrOfMC += 6;
 							writeASM("// Unknown 0x81 variant\n", 24);
 							break;
@@ -910,7 +1069,7 @@ void ReSub() {
 							break;
 						default:
 							// printf("Unknown 0x83 variant, regField=%d\n", regField);
-							ptrOfMC += 3; // Skip this whole 0x83 command
+							ptrOfMC += 3; // Skip this whole 0x83 instruction
 							writeASM("// Unknown 0x83 variant\n", 24);
 							break;
 					}
@@ -938,21 +1097,56 @@ void ReSub() {
 				default:
 					// Unknown opcode
 					char unknown[50];
-					sprintf(unknown, "// Unknown opcode: 0x%02X\n", byte);
+					sprintf(unknown, "# Unknown opcode: %x\n", byte);
 					writeASM(unknown, strlen(unknown));
-					break;
 			}
 			isExtCmd = 0;
+		} else if (segPrefix) {
+			switch (segPrefix) {
+				case 0x65:
+					writeASM("GS: ", 4);
+					break;
+				case 0x64:
+					writeASM("FS: ", 4);
+					break;
+				case 0x3E:
+					writeASM("DS: ", 4);
+					break;
+				case 0x2E:
+					writeASM("CS: ", 4);
+					break;
+				case 0x36:
+					writeASM("SS: ", 4);
+					break;
+				case 0x26:
+					writeASM("ES: ", 4);
+					break;
+			}
+			segPrefix = 0;  // 重置
 		}
 	}
 }
 
-int main() {
+int main(int argv, char *argc[]) {
 	// printf("ISH:%d\n", sizeof(IMAGE_SECTION_HEADER));
-	mapFileToMem("E:\\ExeRe\\Re2.exe");
-	skipToTextSectionTable();
+	if (argv == 1) {
+		printf("No file param input\n");
+		system("pause");
+		exit(0);
+	}
+	mapFileToMem(argc[1]);
+	skipToEntry();
+	printf("Generated ASM Code @0x%d\n---------------------------\n", ptrOfMC - machineCode);
 	ReSub();
-	printf("Generated ASM Code:\n%s", ASMCode);
+	printf("%s\n", ASMCode);
+	memset(ASMCode, 0, 250 * 1024);
+	ASMptr = ASMCode;
+	ptrOfMC = &machineCode[calls[0].addrOfCall + calls[0].val];
+	printf("Generated ASM Code @0x%d\n---------------------------\n", calls[0].addrOfCall + calls[0].val);
+	//printf("%x%x%x%x\n", *ptrOfMC, ptrOfMC[1], ptrOfMC[2], ptrOfMC[3]);
+	isRet = 0;
+	ReSub();
+	printf("%s\n", ASMCode);
 	free(machineCode);
 	return 0;
 }
