@@ -146,6 +146,7 @@ typedef enum {
 	SUB_REG_RM32 = 0x2B,      // SUB reg32, r/m32
 	OP_IMM8_REG = 0x83,     // SUB r/m32, imm8 (requires modrm reg field=5)
 	SUB_RM_REG32 = 0x29,      // SUB r/m32, reg32
+	XOR_RM_REG = 0x31,      // XOR r/m32, r32
 	PUSH_IMM  = 0x68,
 	PUSH_REG  = 0x50,
 	CALL_REL  = 0xE8,
